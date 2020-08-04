@@ -9,6 +9,8 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -16,7 +18,6 @@ import (
 var (
 	// ErrClosed is throw when an error with the sonic server
 	// come from the state of the connection.
-	ErrClosed = errors.New("sonic connection is closed")
 
 	// ErrChanName is throw when the channel name is not supported
 	// by sonic server.
@@ -55,26 +56,64 @@ const (
 	suggest searchCommands = "SUGGEST"
 )
 
-type connection struct {
-	reader      *bufio.Reader
-	conn        net.Conn
+type Conn struct {
+	createdAt time.Time
+	usedAt    int64 // atomic
+
+	pooled      bool
+	Reader      *bufio.Reader
+	netConn     net.Conn
 	cmdMaxBytes int
 	closed      bool
 }
 
+func (cn *Conn) UsedAt() time.Time {
+	unix := atomic.LoadInt64(&cn.usedAt)
+	return time.Unix(unix, 0)
+}
+
+func (cn *Conn) SetUsedAt(tm time.Time) {
+	atomic.StoreInt64(&cn.usedAt, tm.Unix())
+}
+
 type searchClient struct {
-	*connection
+	*Conn
 }
 
 type ingestClient struct {
-	*connection
+	*Conn
 }
 
 type controlClient struct {
-	*connection
+	*Conn
 }
 
-func (c *connection) search(password string) (*searchClient, error) {
+func NewConn(conn net.Conn, ch Channel, password string) *Conn {
+
+	cn := &Conn{
+		netConn:   conn,
+		createdAt: time.Now(),
+	}
+
+	cn.closed = false
+	cn.netConn = conn
+	cn.Reader = bufio.NewReader(cn.netConn)
+
+	cn.SetUsedAt(time.Now())
+
+	err := cn.write(fmt.Sprintf("START %s %s", ch, password))
+	if err != nil {
+		return nil
+	}
+	_, err = cn.read()
+	_, err = cn.read()
+	if err != nil {
+		return nil
+	}
+	return cn
+}
+
+func (c *Conn) search(password string) (*searchClient, error) {
 	err := c.write(fmt.Sprintf("START %s %s", Search, password))
 	if err != nil {
 		return nil, err
@@ -87,7 +126,7 @@ func (c *connection) search(password string) (*searchClient, error) {
 	return &searchClient{c}, nil
 }
 
-func (c *connection) ingest(password string) (*ingestClient, error) {
+func (c *Conn) ingest(password string) (*ingestClient, error) {
 	err := c.write(fmt.Sprintf("START %s %s", Ingest, password))
 	if err != nil {
 		return nil, err
@@ -100,7 +139,7 @@ func (c *connection) ingest(password string) (*ingestClient, error) {
 	return &ingestClient{c}, nil
 }
 
-func (c *connection) control(password string) (*controlClient, error) {
+func (c *Conn) control(password string) (*controlClient, error) {
 	err := c.write(fmt.Sprintf("START %s %s", Control, password))
 	if err != nil {
 		return nil, err
@@ -113,32 +152,32 @@ func (c *connection) control(password string) (*controlClient, error) {
 	return &controlClient{c}, nil
 }
 
-func newConnection(endpoint, password string, channel Channel) (*connection, error) {
-	c := &connection{}
-	c.close()
+func newConnection(endpoint, password string, channel Channel) (*Conn, error) {
+	c := &Conn{}
+	c.Close()
 	conn, err := net.Dial("tcp", endpoint)
 	if err != nil {
 		return nil, err
 	}
 
 	c.closed = false
-	c.conn = conn
-	c.reader = bufio.NewReader(c.conn)
+	c.netConn = conn
+	c.Reader = bufio.NewReader(c.netConn)
 
 	return c, nil
 }
 
-func (c *connection) read() (string, error) {
+func (c *Conn) read() (string, error) {
 	if c.closed {
 		return "", ErrClosed
 	}
 	buffer := bytes.Buffer{}
 	for {
-		line, isPrefix, err := c.reader.ReadLine()
+		line, isPrefix, err := c.Reader.ReadLine()
 		buffer.Write(line)
 		if err != nil {
 			if err == io.EOF {
-				c.close()
+				c.Close()
 			}
 			return "", err
 		}
@@ -168,21 +207,22 @@ func (c *connection) read() (string, error) {
 	return str, nil
 }
 
-func (c connection) write(str string) error {
+func (c Conn) write(str string) error {
 	if c.closed {
 		return ErrClosed
 	}
-	_, err := c.conn.Write([]byte(str + "\r\n"))
+	_, err := c.netConn.Write([]byte(str + "\r\n"))
 	return err
 }
 
-func (c *connection) close() {
-	if c.conn != nil {
-		_ = c.conn.Close()
-		c.conn = nil
+func (c *Conn) Close() (err error) {
+	if c.netConn != nil {
+		err = c.netConn.Close()
+		c.netConn = nil
 	}
 	c.closed = true
-	c.reader = nil
+	c.Reader = nil
+	return err
 }
 
 // Ensure splitting on a valid leading byte
@@ -206,7 +246,7 @@ func splitText(longString string, maxLen int) []string {
 	return splits
 }
 
-func (c *connection) push(collection, bucket, object, text string) (err error) {
+func (c *Conn) push(collection, bucket, object, text string) (err error) {
 	patterns := []struct {
 		Pattern     string
 		Replacement string
@@ -236,7 +276,7 @@ func (c *connection) push(collection, bucket, object, text string) (err error) {
 	return nil
 }
 
-func (c *connection) Pop(collection, bucket, object, text string) (err error) {
+func (c *Conn) Pop(collection, bucket, object, text string) (err error) {
 	err = c.write(fmt.Sprintf("%s %s %s %s \"%s\"", pop, collection, bucket, object, text))
 	if err != nil {
 		return err
@@ -250,7 +290,7 @@ func (c *connection) Pop(collection, bucket, object, text string) (err error) {
 	return nil
 }
 
-func (c *connection) Count(collection, bucket, object string) (cnt int, err error) {
+func (c *Conn) Count(collection, bucket, object string) (cnt int, err error) {
 	err = c.write(fmt.Sprintf("%s %s %s", count, collection, buildCountQuery(bucket, object)))
 	if err != nil {
 		return 0, err
@@ -275,7 +315,7 @@ func buildCountQuery(bucket, object string) string {
 	return builder.String()
 }
 
-func (c *connection) FlushCollection(collection string) (err error) {
+func (c *Conn) FlushCollection(collection string) (err error) {
 	err = c.write(fmt.Sprintf("%s %s", flushc, collection))
 	if err != nil {
 		return err
@@ -289,7 +329,7 @@ func (c *connection) FlushCollection(collection string) (err error) {
 	return nil
 }
 
-func (c *connection) FlushBucket(collection, bucket string) (err error) {
+func (c *Conn) FlushBucket(collection, bucket string) (err error) {
 	err = c.write(fmt.Sprintf("%s %s %s", flushb, collection, bucket))
 	if err != nil {
 		return err
@@ -303,7 +343,7 @@ func (c *connection) FlushBucket(collection, bucket string) (err error) {
 	return nil
 }
 
-func (c *connection) FlushObject(collection, bucket, object string) (err error) {
+func (c *Conn) FlushObject(collection, bucket, object string) (err error) {
 	err = c.write(fmt.Sprintf("%s %s %s %s", flusho, collection, bucket, object))
 	if err != nil {
 		return err
@@ -317,7 +357,7 @@ func (c *connection) FlushObject(collection, bucket, object string) (err error) 
 	return nil
 }
 
-func (c *connection) Query(collection, bucket, term string, limit, offset int) (results []string, err error) {
+func (c *Conn) Query(collection, bucket, term string, limit, offset int) (results []string, err error) {
 	err = c.write(fmt.Sprintf("%s %s %s \"%s\" LIMIT(%d) OFFSET(%d)", query, collection, bucket, term, limit, offset))
 	if err != nil {
 		return nil, err
@@ -337,7 +377,7 @@ func (c *connection) Query(collection, bucket, term string, limit, offset int) (
 	return getSearchResults(read, string(query)), nil
 }
 
-func (c *connection) Suggest(collection, bucket, word string, limit int) (results []string, err error) {
+func (c *Conn) Suggest(collection, bucket, word string, limit int) (results []string, err error) {
 	err = c.write(fmt.Sprintf("%s %s %s \"%s\" LIMIT(%d)", suggest, collection, bucket, word, limit))
 	if err != nil {
 		return nil, err
