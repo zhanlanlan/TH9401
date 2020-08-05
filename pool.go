@@ -10,6 +10,7 @@ import (
 	"time"
 )
 
+// fuck shutup
 var (
 	ErrClosed      = errors.New("redis: client is closed")
 	ErrPoolTimeout = errors.New("redis: connection pool timeout")
@@ -35,13 +36,25 @@ type Stats struct {
 	StaleConns uint32 // number of stale connections removed from the pool
 }
 
-type Pooler interface {
-	NewConn(context.Context) (*Conn, error)
-	CloseConn(*Conn) error
+// ConnInterface 连接对象接口
+type ConnInterface interface {
+	SetPooled(bool)
+	GetPolled() bool
+	UsedAt() time.Time
+	CreatedAt() time.Time
 
-	Get(context.Context) (*Conn, error)
-	Put(*Conn)
-	Remove(*Conn, error)
+	Buffered() int
+	Close() error
+}
+
+// Pooler pool interface
+type Pooler interface {
+	NewConn(context.Context) (ConnInterface, error)
+	CloseConn(ConnInterface) error
+
+	Get(context.Context) (ConnInterface, error)
+	Put(ConnInterface)
+	Remove(ConnInterface, error)
 
 	Len() int
 	IdleLen() int
@@ -50,16 +63,16 @@ type Pooler interface {
 	Close() error
 }
 
+// Options pool options
 type Options struct {
-	Channel  Channel
-	Password string
-	Dialer   func(context.Context) (net.Conn, error)
-	OnClose  func(*Conn) error
+	Dialer    func(context.Context) (net.Conn, error)
+	OnClose   func(ConnInterface) error
+	Connector func(context.Context, net.Conn) ConnInterface
 
 	PoolSize           int
-	MinIdleConns       int
-	MaxConnAge         time.Duration
-	PoolTimeout        time.Duration
+	MinIdleConns       int           // 最小连接数
+	MaxConnAge         time.Duration // 连接的最大寿命
+	PoolTimeout        time.Duration //
 	IdleTimeout        time.Duration
 	IdleCheckFrequency time.Duration
 }
@@ -79,8 +92,8 @@ type ConnPool struct {
 	queue chan struct{}
 
 	connsMu      sync.Mutex
-	conns        []*Conn
-	idleConns    []*Conn
+	conns        []ConnInterface
+	idleConns    []ConnInterface
 	poolSize     int
 	idleConnsLen int
 
@@ -94,12 +107,13 @@ var _ Pooler = (*ConnPool)(nil)
 
 // NewConnPool new sonic connection poll
 func NewConnPool(opt *Options) *ConnPool {
+
 	p := &ConnPool{
 		opt: opt,
 
 		queue:     make(chan struct{}, opt.PoolSize),
-		conns:     make([]*Conn, 0, opt.PoolSize),
-		idleConns: make([]*Conn, 0, opt.PoolSize),
+		conns:     make([]ConnInterface, 0, opt.PoolSize),
+		idleConns: make([]ConnInterface, 0, opt.PoolSize),
 		closedCh:  make(chan struct{}),
 	}
 
@@ -114,6 +128,7 @@ func NewConnPool(opt *Options) *ConnPool {
 	return p
 }
 
+// checkMinIdleConns 填满链接池
 func (p *ConnPool) checkMinIdleConns() {
 	if p.opt.MinIdleConns == 0 {
 		return
@@ -146,11 +161,11 @@ func (p *ConnPool) addIdleConn() error {
 	return nil
 }
 
-func (p *ConnPool) NewConn(ctx context.Context) (*Conn, error) {
+func (p *ConnPool) NewConn(ctx context.Context) (ConnInterface, error) {
 	return p.newConn(ctx, false)
 }
 
-func (p *ConnPool) newConn(ctx context.Context, pooled bool) (*Conn, error) {
+func (p *ConnPool) newConn(ctx context.Context, pooled bool) (ConnInterface, error) {
 	cn, err := p.dialConn(ctx, pooled)
 	if err != nil {
 		return nil, err
@@ -161,7 +176,7 @@ func (p *ConnPool) newConn(ctx context.Context, pooled bool) (*Conn, error) {
 	if pooled {
 		// If pool is full remove the cn on next Put.
 		if p.poolSize >= p.opt.PoolSize {
-			cn.pooled = false
+			cn.SetPooled(false)
 		} else {
 			p.poolSize++
 		}
@@ -170,7 +185,7 @@ func (p *ConnPool) newConn(ctx context.Context, pooled bool) (*Conn, error) {
 	return cn, nil
 }
 
-func (p *ConnPool) dialConn(ctx context.Context, pooled bool) (*Conn, error) {
+func (p *ConnPool) dialConn(ctx context.Context, pooled bool) (ConnInterface, error) {
 	if p.closed() {
 		return nil, ErrClosed
 	}
@@ -188,8 +203,8 @@ func (p *ConnPool) dialConn(ctx context.Context, pooled bool) (*Conn, error) {
 		return nil, err
 	}
 
-	cn := NewConn(netConn, p.opt.Channel, p.opt.Password)
-	cn.pooled = pooled
+	cn := p.opt.Connector(ctx, netConn)
+	cn.SetPooled(pooled)
 	return cn, nil
 }
 
@@ -225,7 +240,7 @@ func (p *ConnPool) getLastDialError() error {
 }
 
 // Get returns existed connection from the pool or creates a new one.
-func (p *ConnPool) Get(ctx context.Context) (*Conn, error) {
+func (p *ConnPool) Get(ctx context.Context) (ConnInterface, error) {
 	if p.closed() {
 		return nil, ErrClosed
 	}
@@ -308,7 +323,7 @@ func (p *ConnPool) freeTurn() {
 	<-p.queue
 }
 
-func (p *ConnPool) popIdle() *Conn {
+func (p *ConnPool) popIdle() ConnInterface {
 	if len(p.idleConns) == 0 {
 		return nil
 	}
@@ -321,14 +336,14 @@ func (p *ConnPool) popIdle() *Conn {
 	return cn
 }
 
-func (p *ConnPool) Put(cn *Conn) {
-	if cn.Reader.Buffered() > 0 {
+func (p *ConnPool) Put(cn ConnInterface) {
+	if cn.Buffered() > 0 {
 		fmt.Printf("Conn has unread data")
 		p.Remove(cn, BadConnError)
 		return
 	}
 
-	if !cn.pooled {
+	if !cn.GetPolled() {
 		p.Remove(cn, nil)
 		return
 	}
@@ -340,28 +355,28 @@ func (p *ConnPool) Put(cn *Conn) {
 	p.freeTurn()
 }
 
-func (p *ConnPool) Remove(cn *Conn, reason error) {
+func (p *ConnPool) Remove(cn ConnInterface, reason error) {
 	p.removeConnWithLock(cn)
 	p.freeTurn()
 	_ = p.closeConn(cn)
 }
 
-func (p *ConnPool) CloseConn(cn *Conn) error {
+func (p *ConnPool) CloseConn(cn ConnInterface) error {
 	p.removeConnWithLock(cn)
 	return p.closeConn(cn)
 }
 
-func (p *ConnPool) removeConnWithLock(cn *Conn) {
+func (p *ConnPool) removeConnWithLock(cn ConnInterface) {
 	p.connsMu.Lock()
 	p.removeConn(cn)
 	p.connsMu.Unlock()
 }
 
-func (p *ConnPool) removeConn(cn *Conn) {
+func (p *ConnPool) removeConn(cn ConnInterface) {
 	for i, c := range p.conns {
 		if c == cn {
 			p.conns = append(p.conns[:i], p.conns[i+1:]...)
-			if cn.pooled {
+			if cn.GetPolled() {
 				p.poolSize--
 				p.checkMinIdleConns()
 			}
@@ -370,7 +385,7 @@ func (p *ConnPool) removeConn(cn *Conn) {
 	}
 }
 
-func (p *ConnPool) closeConn(cn *Conn) error {
+func (p *ConnPool) closeConn(cn ConnInterface) error {
 	if p.opt.OnClose != nil {
 		_ = p.opt.OnClose(cn)
 	}
@@ -410,7 +425,7 @@ func (p *ConnPool) closed() bool {
 	return atomic.LoadUint32(&p._closed) == 1
 }
 
-func (p *ConnPool) Filter(fn func(*Conn) bool) error {
+func (p *ConnPool) Filter(fn func(ConnInterface) bool) error {
 	var firstErr error
 	p.connsMu.Lock()
 	for _, cn := range p.conns {
@@ -491,7 +506,7 @@ func (p *ConnPool) ReapStaleConns() (int, error) {
 	return n, nil
 }
 
-func (p *ConnPool) reapStaleConn() *Conn {
+func (p *ConnPool) reapStaleConn() ConnInterface {
 	if len(p.idleConns) == 0 {
 		return nil
 	}
@@ -508,7 +523,7 @@ func (p *ConnPool) reapStaleConn() *Conn {
 	return cn
 }
 
-func (p *ConnPool) isStaleConn(cn *Conn) bool {
+func (p *ConnPool) isStaleConn(cn ConnInterface) bool {
 	if p.opt.IdleTimeout == 0 && p.opt.MaxConnAge == 0 {
 		return false
 	}
@@ -517,7 +532,7 @@ func (p *ConnPool) isStaleConn(cn *Conn) bool {
 	if p.opt.IdleTimeout > 0 && now.Sub(cn.UsedAt()) >= p.opt.IdleTimeout {
 		return true
 	}
-	if p.opt.MaxConnAge > 0 && now.Sub(cn.createdAt) >= p.opt.MaxConnAge {
+	if p.opt.MaxConnAge > 0 && now.Sub(cn.CreatedAt()) >= p.opt.MaxConnAge {
 		return true
 	}
 
