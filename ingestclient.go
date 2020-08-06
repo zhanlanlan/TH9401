@@ -17,15 +17,15 @@ var PATTERNS = []struct {
 	{"\n", "\\n"},
 	{"\"", "\\\""}}
 
-type ingesterCommands string
+type ingesteCommands string
 
 const (
-	push   ingesterCommands = "PUSH"
-	pop    ingesterCommands = "POP"
-	count  ingesterCommands = "COUNT"
-	flushb ingesterCommands = "FLUSHB"
-	flushc ingesterCommands = "FLUSHC"
-	flusho ingesterCommands = "FLUSHO"
+	push   ingesteCommands = "PUSH"
+	pop    ingesteCommands = "POP"
+	count  ingesteCommands = "COUNT"
+	flushb ingesteCommands = "FLUSHB"
+	flushc ingesteCommands = "FLUSHC"
+	flusho ingesteCommands = "FLUSHO"
 )
 
 // IngestClient ...

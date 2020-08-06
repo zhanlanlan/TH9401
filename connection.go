@@ -38,13 +38,6 @@ const (
 	Control Channel = "control"
 )
 
-type searchCommands string
-
-const (
-	query   searchCommands = "QUERY"
-	suggest searchCommands = "SUGGEST"
-)
-
 // Conn 链接实例
 type Conn struct {
 	createdAt time.Time
