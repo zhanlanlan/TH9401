@@ -12,9 +12,9 @@ import (
 
 // fuck shutup
 var (
-	ErrClosed      = errors.New("redis: client is closed")
-	ErrPoolTimeout = errors.New("redis: connection pool timeout")
-	BadConnError   = errors.New("redis: bad connection")
+	ErrClosed      = errors.New("sonic: client is closed")
+	ErrPoolTimeout = errors.New("sonic: connection pool timeout")
+	BadConnError   = errors.New("sonic: bad connection")
 )
 
 var timers = sync.Pool{
@@ -36,25 +36,14 @@ type Stats struct {
 	StaleConns uint32 // number of stale connections removed from the pool
 }
 
-// ConnInterface 连接对象接口
-type ConnInterface interface {
-	SetPooled(bool)
-	GetPolled() bool
-	UsedAt() time.Time
-	CreatedAt() time.Time
-
-	Buffered() int
-	Close() error
-}
-
 // Pooler pool interface
 type Pooler interface {
-	NewConn(context.Context) (ConnInterface, error)
-	CloseConn(ConnInterface) error
+	NewConn(context.Context) (*Conn, error)
+	CloseConn(*Conn) error
 
-	Get(context.Context) (ConnInterface, error)
-	Put(ConnInterface)
-	Remove(ConnInterface, error)
+	Get(context.Context) (*Conn, error)
+	Put(*Conn)
+	Remove(*Conn, error)
 
 	Len() int
 	IdleLen() int
@@ -65,16 +54,16 @@ type Pooler interface {
 
 // Options pool options
 type Options struct {
-	Dialer    func(context.Context) (net.Conn, error)
-	OnClose   func(ConnInterface) error
-	Connector func(context.Context, net.Conn) ConnInterface
+	Dialer    func(context.Context) (net.Conn, error)        // 发起网络连接的对象
+	OnClose   func(*Conn) error                              // 关闭连接时执行的操作
+	Connector func(context.Context, net.Conn) (*Conn, error) // 建立链接
 
-	PoolSize           int
+	PoolSize           int           // 连接池大小
 	MinIdleConns       int           // 最小连接数
-	MaxConnAge         time.Duration // 连接的最大寿命
-	PoolTimeout        time.Duration //
-	IdleTimeout        time.Duration
-	IdleCheckFrequency time.Duration
+	MaxConnAge         time.Duration // 链接的最大寿命
+	PoolTimeout        time.Duration // 获取链接的等待时间
+	IdleTimeout        time.Duration // 链接空闲时间
+	IdleCheckFrequency time.Duration // 检查链接的间隔
 }
 
 type lastDialErrorWrap struct {
@@ -92,8 +81,8 @@ type ConnPool struct {
 	queue chan struct{}
 
 	connsMu      sync.Mutex
-	conns        []ConnInterface
-	idleConns    []ConnInterface
+	conns        []*Conn
+	idleConns    []*Conn
 	poolSize     int
 	idleConnsLen int
 
@@ -105,15 +94,15 @@ type ConnPool struct {
 
 var _ Pooler = (*ConnPool)(nil)
 
-// NewConnPool new sonic connection poll
+// NewConnPool new connection poll
 func NewConnPool(opt *Options) *ConnPool {
 
 	p := &ConnPool{
 		opt: opt,
 
 		queue:     make(chan struct{}, opt.PoolSize),
-		conns:     make([]ConnInterface, 0, opt.PoolSize),
-		idleConns: make([]ConnInterface, 0, opt.PoolSize),
+		conns:     make([]*Conn, 0, opt.PoolSize),
+		idleConns: make([]*Conn, 0, opt.PoolSize),
 		closedCh:  make(chan struct{}),
 	}
 
@@ -128,7 +117,98 @@ func NewConnPool(opt *Options) *ConnPool {
 	return p
 }
 
-// checkMinIdleConns 填满链接池
+// Get returns existed connection from the pool or creates a new one.
+func (p *ConnPool) Get(ctx context.Context) (*Conn, error) {
+	// 如果连接池已经关闭
+	if p.closed() {
+		return nil, ErrClosed
+	}
+
+	// 首先拿到牌子
+	err := p.waitTurn(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// 尝试从空闲连接池中拿到一个连接
+	for {
+		p.connsMu.Lock()
+		cn := p.popIdle() // 取出一个空闲链接
+		p.connsMu.Unlock()
+
+		if cn == nil {
+			break
+		}
+
+		if p.isStaleConn(cn) { // 是否是稳定链接
+			_ = p.CloseConn(cn) // 不是就关了
+			continue
+		}
+
+		atomic.AddUint32(&p.stats.Hits, 1) // 找到空闲链接数 + 1
+		return cn, nil
+	}
+
+	atomic.AddUint32(&p.stats.Misses, 1) // 找不到空闲链接 + 1
+
+	newcn, err := p.newConn(ctx, true) // 找不到就自己弄个链接吧
+	if err != nil {
+		p.freeTurn() // 还牌子
+		return nil, err
+	}
+
+	return newcn, nil
+}
+
+// Put 用完之后把链接还回来
+func (p *ConnPool) Put(cn *Conn) {
+	if cn.Buffered() > 0 { // 如果还有未读数据则扔掉该链接 并标记为坏链接
+		fmt.Printf("Conn has unread data")
+		p.Remove(cn, BadConnError)
+		return
+	}
+
+	if !cn.pooled {
+		p.Remove(cn, nil)
+		return
+	}
+
+	p.connsMu.Lock()
+	p.idleConns = append(p.idleConns, cn)
+	p.idleConnsLen++
+	p.connsMu.Unlock()
+	p.freeTurn()
+}
+
+// Close 关闭连接池
+func (p *ConnPool) Close() error {
+	if !atomic.CompareAndSwapUint32(&p._closed, 0, 1) {
+		return ErrClosed
+	}
+	close(p.closedCh)
+
+	var firstErr error
+	p.connsMu.Lock()
+	for _, cn := range p.conns {
+		if err := p.closeConn(cn); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	p.conns = nil
+	p.poolSize = 0
+	p.idleConns = nil
+	p.idleConnsLen = 0
+	p.connsMu.Unlock()
+
+	return firstErr
+}
+
+// NewConn 新建一个链接
+func (p *ConnPool) NewConn(ctx context.Context) (*Conn, error) {
+	return p.newConn(ctx, false)
+}
+
+// checkMinIdleConns 将连接数增加到最小链接数
 func (p *ConnPool) checkMinIdleConns() {
 	if p.opt.MinIdleConns == 0 {
 		return
@@ -148,6 +228,7 @@ func (p *ConnPool) checkMinIdleConns() {
 	}
 }
 
+// addIdleConn 添加空闲链接
 func (p *ConnPool) addIdleConn() error {
 	cn, err := p.dialConn(context.TODO(), true)
 	if err != nil {
@@ -161,11 +242,7 @@ func (p *ConnPool) addIdleConn() error {
 	return nil
 }
 
-func (p *ConnPool) NewConn(ctx context.Context) (ConnInterface, error) {
-	return p.newConn(ctx, false)
-}
-
-func (p *ConnPool) newConn(ctx context.Context, pooled bool) (ConnInterface, error) {
+func (p *ConnPool) newConn(ctx context.Context, pooled bool) (*Conn, error) {
 	cn, err := p.dialConn(ctx, pooled)
 	if err != nil {
 		return nil, err
@@ -176,7 +253,7 @@ func (p *ConnPool) newConn(ctx context.Context, pooled bool) (ConnInterface, err
 	if pooled {
 		// If pool is full remove the cn on next Put.
 		if p.poolSize >= p.opt.PoolSize {
-			cn.SetPooled(false)
+			cn.pooled = false
 		} else {
 			p.poolSize++
 		}
@@ -185,7 +262,7 @@ func (p *ConnPool) newConn(ctx context.Context, pooled bool) (ConnInterface, err
 	return cn, nil
 }
 
-func (p *ConnPool) dialConn(ctx context.Context, pooled bool) (ConnInterface, error) {
+func (p *ConnPool) dialConn(ctx context.Context, pooled bool) (*Conn, error) {
 	if p.closed() {
 		return nil, ErrClosed
 	}
@@ -203,8 +280,11 @@ func (p *ConnPool) dialConn(ctx context.Context, pooled bool) (ConnInterface, er
 		return nil, err
 	}
 
-	cn := p.opt.Connector(ctx, netConn)
-	cn.SetPooled(pooled)
+	cn, err := p.opt.Connector(ctx, netConn)
+	if err != nil {
+		return nil, err
+	}
+	cn.pooled = pooled
 	return cn, nil
 }
 
@@ -239,51 +319,13 @@ func (p *ConnPool) getLastDialError() error {
 	return nil
 }
 
-// Get returns existed connection from the pool or creates a new one.
-func (p *ConnPool) Get(ctx context.Context) (ConnInterface, error) {
-	if p.closed() {
-		return nil, ErrClosed
-	}
-
-	err := p.waitTurn(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	for {
-		p.connsMu.Lock()
-		cn := p.popIdle()
-		p.connsMu.Unlock()
-
-		if cn == nil {
-			break
-		}
-
-		if p.isStaleConn(cn) {
-			_ = p.CloseConn(cn)
-			continue
-		}
-
-		atomic.AddUint32(&p.stats.Hits, 1)
-		return cn, nil
-	}
-
-	atomic.AddUint32(&p.stats.Misses, 1)
-
-	newcn, err := p.newConn(ctx, true)
-	if err != nil {
-		p.freeTurn()
-		return nil, err
-	}
-
-	return newcn, nil
-}
-
 func (p *ConnPool) getTurn() {
 	p.queue <- struct{}{}
 }
 
+// 拿牌子
 func (p *ConnPool) waitTurn(ctx context.Context) error {
+	// 快速路线
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -299,6 +341,7 @@ func (p *ConnPool) waitTurn(ctx context.Context) error {
 	timer := timers.Get().(*time.Timer)
 	timer.Reset(p.opt.PoolTimeout)
 
+	// 慢速路线
 	select {
 	case <-ctx.Done():
 		if !timer.Stop() {
@@ -319,11 +362,12 @@ func (p *ConnPool) waitTurn(ctx context.Context) error {
 	}
 }
 
+// 还牌子
 func (p *ConnPool) freeTurn() {
 	<-p.queue
 }
 
-func (p *ConnPool) popIdle() ConnInterface {
+func (p *ConnPool) popIdle() *Conn {
 	if len(p.idleConns) == 0 {
 		return nil
 	}
@@ -336,47 +380,30 @@ func (p *ConnPool) popIdle() ConnInterface {
 	return cn
 }
 
-func (p *ConnPool) Put(cn ConnInterface) {
-	if cn.Buffered() > 0 {
-		fmt.Printf("Conn has unread data")
-		p.Remove(cn, BadConnError)
-		return
-	}
-
-	if !cn.GetPolled() {
-		p.Remove(cn, nil)
-		return
-	}
-
-	p.connsMu.Lock()
-	p.idleConns = append(p.idleConns, cn)
-	p.idleConnsLen++
-	p.connsMu.Unlock()
-	p.freeTurn()
-}
-
-func (p *ConnPool) Remove(cn ConnInterface, reason error) {
+// Remove 移除一个链接
+func (p *ConnPool) Remove(cn *Conn, reason error) {
 	p.removeConnWithLock(cn)
 	p.freeTurn()
 	_ = p.closeConn(cn)
 }
 
-func (p *ConnPool) CloseConn(cn ConnInterface) error {
+// CloseConn ...
+func (p *ConnPool) CloseConn(cn *Conn) error {
 	p.removeConnWithLock(cn)
 	return p.closeConn(cn)
 }
 
-func (p *ConnPool) removeConnWithLock(cn ConnInterface) {
+func (p *ConnPool) removeConnWithLock(cn *Conn) {
 	p.connsMu.Lock()
 	p.removeConn(cn)
 	p.connsMu.Unlock()
 }
 
-func (p *ConnPool) removeConn(cn ConnInterface) {
+func (p *ConnPool) removeConn(cn *Conn) {
 	for i, c := range p.conns {
 		if c == cn {
 			p.conns = append(p.conns[:i], p.conns[i+1:]...)
-			if cn.GetPolled() {
+			if cn.pooled {
 				p.poolSize--
 				p.checkMinIdleConns()
 			}
@@ -385,7 +412,7 @@ func (p *ConnPool) removeConn(cn ConnInterface) {
 	}
 }
 
-func (p *ConnPool) closeConn(cn ConnInterface) error {
+func (p *ConnPool) closeConn(cn *Conn) error {
 	if p.opt.OnClose != nil {
 		_ = p.opt.OnClose(cn)
 	}
@@ -408,6 +435,7 @@ func (p *ConnPool) IdleLen() int {
 	return n
 }
 
+// Stats 返回连接池状态
 func (p *ConnPool) Stats() *Stats {
 	idleLen := p.IdleLen()
 	return &Stats{
@@ -425,7 +453,8 @@ func (p *ConnPool) closed() bool {
 	return atomic.LoadUint32(&p._closed) == 1
 }
 
-func (p *ConnPool) Filter(fn func(ConnInterface) bool) error {
+// Filter ...
+func (p *ConnPool) Filter(fn func(*Conn) bool) error {
 	var firstErr error
 	p.connsMu.Lock()
 	for _, cn := range p.conns {
@@ -436,28 +465,6 @@ func (p *ConnPool) Filter(fn func(ConnInterface) bool) error {
 		}
 	}
 	p.connsMu.Unlock()
-	return firstErr
-}
-
-func (p *ConnPool) Close() error {
-	if !atomic.CompareAndSwapUint32(&p._closed, 0, 1) {
-		return ErrClosed
-	}
-	close(p.closedCh)
-
-	var firstErr error
-	p.connsMu.Lock()
-	for _, cn := range p.conns {
-		if err := p.closeConn(cn); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	p.conns = nil
-	p.poolSize = 0
-	p.idleConns = nil
-	p.idleConnsLen = 0
-	p.connsMu.Unlock()
-
 	return firstErr
 }
 
@@ -485,6 +492,7 @@ func (p *ConnPool) reaper(frequency time.Duration) {
 	}
 }
 
+// ReapStaleConns 淘汰陈旧链接
 func (p *ConnPool) ReapStaleConns() (int, error) {
 	var n int
 	for {
@@ -506,7 +514,9 @@ func (p *ConnPool) ReapStaleConns() (int, error) {
 	return n, nil
 }
 
-func (p *ConnPool) reapStaleConn() ConnInterface {
+// reapStaleConn 淘汰一个陈旧链接
+// 淘汰队列中队首的链接
+func (p *ConnPool) reapStaleConn() *Conn {
 	if len(p.idleConns) == 0 {
 		return nil
 	}
@@ -518,21 +528,22 @@ func (p *ConnPool) reapStaleConn() ConnInterface {
 
 	p.idleConns = append(p.idleConns[:0], p.idleConns[1:]...)
 	p.idleConnsLen--
-	p.removeConn(cn)
+	p.removeConn(cn) // 连接池中移除
 
 	return cn
 }
 
-func (p *ConnPool) isStaleConn(cn ConnInterface) bool {
+// isStaleConn 是否是陈旧链接
+func (p *ConnPool) isStaleConn(cn *Conn) bool {
 	if p.opt.IdleTimeout == 0 && p.opt.MaxConnAge == 0 {
 		return false
 	}
 
 	now := time.Now()
-	if p.opt.IdleTimeout > 0 && now.Sub(cn.UsedAt()) >= p.opt.IdleTimeout {
+	if p.opt.IdleTimeout > 0 && now.Sub(cn.GetUsedAt()) >= p.opt.IdleTimeout {
 		return true
 	}
-	if p.opt.MaxConnAge > 0 && now.Sub(cn.CreatedAt()) >= p.opt.MaxConnAge {
+	if p.opt.MaxConnAge > 0 && now.Sub(cn.GetCreatedAt()) >= p.opt.MaxConnAge {
 		return true
 	}
 

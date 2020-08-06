@@ -38,17 +38,6 @@ const (
 	Control Channel = "control"
 )
 
-type ingesterCommands string
-
-const (
-	push   ingesterCommands = "PUSH"
-	pop    ingesterCommands = "POP"
-	count  ingesterCommands = "COUNT"
-	flushb ingesterCommands = "FLUSHB"
-	flushc ingesterCommands = "FLUSHC"
-	flusho ingesterCommands = "FLUSHO"
-)
-
 type searchCommands string
 
 const (
@@ -56,6 +45,7 @@ const (
 	suggest searchCommands = "SUGGEST"
 )
 
+// Conn 链接实例
 type Conn struct {
 	createdAt time.Time
 	usedAt    int64 // atomic
@@ -67,14 +57,109 @@ type Conn struct {
 	closed      bool
 }
 
-func (cn *Conn) UsedAt() time.Time {
+// GetUsedAt ...
+func (cn *Conn) GetUsedAt() time.Time {
 	unix := atomic.LoadInt64(&cn.usedAt)
 	return time.Unix(unix, 0)
 }
 
-func (cn *Conn) SetUsedAt(tm time.Time) {
+// SetUsedAt ...
+func (cn *Conn) setUsedAt(tm time.Time) {
 	atomic.StoreInt64(&cn.usedAt, tm.Unix())
 }
+
+// GetCreatedAt ...
+func (cn *Conn) GetCreatedAt() time.Time {
+	return cn.createdAt
+}
+
+// Buffered ...
+func (cn *Conn) Buffered() int {
+	return cn.Reader.Buffered()
+}
+
+// NewConn ...
+func NewConn(netConn net.Conn, ch Channel, password string) (conn *Conn, err error) {
+
+	conn = &Conn{
+		netConn:   netConn,
+		usedAt:    time.Now().Unix(),
+		createdAt: time.Now(),
+		Reader:    bufio.NewReader(netConn),
+	}
+
+	conn.setUsedAt(time.Now())
+
+	err = conn.write(fmt.Sprintf("START %s %s", ch, password))
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = conn.read()     // CONNECTED
+	line, err := conn.read() // STARTED
+	if err != nil {
+		return nil, err
+	}
+
+	ss := strings.FieldsFunc(line, func(r rune) bool {
+		if unicode.IsSpace(r) || r == '(' || r == ')' {
+			return true
+		}
+		return false
+	})
+	bufferSize, err := strconv.Atoi(ss[len(ss)-1])
+	if err != nil {
+		return nil, fmt.Errorf("Unable to parse STARTED response: %s", line)
+	}
+	conn.cmdMaxBytes = bufferSize
+
+	return conn, nil
+}
+
+// Read read line from conn
+func (cn *Conn) Read() (string, error) {
+	if cn.closed {
+		return "", ErrClosed
+	}
+	buffer := bytes.Buffer{}
+	for {
+		line, isPrefix, err := cn.Reader.ReadLine()
+		buffer.Write(line)
+		if err != nil {
+			if err == io.EOF {
+				cn.Close()
+			}
+			return "", err
+		}
+		if !isPrefix {
+			break
+		}
+	}
+
+	str := buffer.String()
+	if strings.HasPrefix(str, "ERR ") {
+		return "", errors.New(str[4:])
+	}
+
+	return str, nil
+}
+
+// Write write with end of "\r\n"
+func (cn *Conn) Write(str string) error {
+	if cn.closed {
+		return ErrClosed
+	}
+
+	buf := bytes.Buffer{}
+	buf.WriteString(str)
+	buf.WriteString("\r\n")
+
+	_, err := cn.netConn.Write(buf.Bytes())
+	return err
+}
+
+// ---------------------finished-----------------
+// --------------------unfinished----------------
 
 type searchClient struct {
 	*Conn
@@ -86,31 +171,6 @@ type ingestClient struct {
 
 type controlClient struct {
 	*Conn
-}
-
-func NewConn(conn net.Conn, ch Channel, password string) *Conn {
-
-	cn := &Conn{
-		netConn:   conn,
-		createdAt: time.Now(),
-	}
-
-	cn.closed = false
-	cn.netConn = conn
-	cn.Reader = bufio.NewReader(cn.netConn)
-
-	cn.SetUsedAt(time.Now())
-
-	err := cn.write(fmt.Sprintf("START %s %s", ch, password))
-	if err != nil {
-		return nil
-	}
-	_, err = cn.read()
-	_, err = cn.read()
-	if err != nil {
-		return nil
-	}
-	return cn
 }
 
 func (c *Conn) search(password string) (*searchClient, error) {
@@ -190,20 +250,7 @@ func (c *Conn) read() (string, error) {
 	if strings.HasPrefix(str, "ERR ") {
 		return "", errors.New(str[4:])
 	}
-	if strings.HasPrefix(str, "STARTED ") {
 
-		ss := strings.FieldsFunc(str, func(r rune) bool {
-			if unicode.IsSpace(r) || r == '(' || r == ')' {
-				return true
-			}
-			return false
-		})
-		bufferSize, err := strconv.Atoi(ss[len(ss)-1])
-		if err != nil {
-			return "", fmt.Errorf("Unable to parse STARTED response: %s", str)
-		}
-		c.cmdMaxBytes = bufferSize
-	}
 	return str, nil
 }
 
@@ -232,11 +279,11 @@ func (c *Conn) Close() (err error) {
 // taking O(n) time (both ways!),
 // whereas slicing a string simply returns a new string header backed by the same array as the original
 // (taking constant time).
-func splitText(longString string, maxLen int) []string {
+func (c *Conn) splitText(longString string) []string {
 	var splits []string
 
 	var l, r int
-	for l, r = 0, maxLen; r < len(longString); l, r = r, r+maxLen {
+	for l, r = 0, c.cmdMaxBytes/2; r < len(longString); l, r = r, r+c.cmdMaxBytes/2 {
 		for !utf8.RuneStart(longString[r]) {
 			r--
 		}
@@ -257,7 +304,7 @@ func (c *Conn) push(collection, bucket, object, text string) (err error) {
 		text = strings.Replace(text, v.Pattern, v.Replacement, -1)
 	}
 
-	chunks := splitText(text, c.cmdMaxBytes/2)
+	chunks := c.splitText(text)
 	// split chunks with partial success will yield single error
 	for _, chunk := range chunks {
 		err = c.write(fmt.Sprintf("%s %s %s %s \"%s\"", push, collection, bucket, object, chunk))
